@@ -1,512 +1,371 @@
+require("dotenv").config();
+
 const express = require("express");
-const multer = require("multer");
 const fs = require("fs");
+const multer = require("multer");
+
+const { createCanvas, loadImage } = require("@napi-rs/canvas");
 const { PDFParse } = require("pdf-parse");
-const mammoth = require("mammoth");
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-/* ---------------- CLEAN + STRUCTURE ---------------- */
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL;
+const MAX_IMAGE_DIMENSION = Number.parseInt(
+  process.env.MAX_IMAGE_DIMENSION || "1600",
+  10
+);
+const MAX_IMAGE_BYTES = Number.parseInt(
+  process.env.MAX_IMAGE_BYTES || `${1024 * 1024}`,
+  10
+);
+const JPEG_QUALITIES = [0.82, 0.72, 0.62, 0.52, 0.42];
+const DEFAULT_IMAGE_PROMPT = [
+  "Analyze this image from a document. Extract all meaningful information.",
+  "Describe diagrams, charts, labels, and concepts clearly.",
+  "Convert the content into structured bullet points for learning.",
+  'Respond in JSON with keys "description" and "key_points".',
+  '"description" must be a string and "key_points" must be an array of strings.',
+].join(" ");
 
-function normalizeInlineSpacing(text) {
-  return String(text || "")
-    .replace(/\u00A0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\s+([,.;:!?])/g, "$1")
-    .trim();
+function validateGeminiConfiguration() {
+  if (!GEMINI_API_KEY) {
+    const error = new Error("GEMINI_API_KEY is not configured");
+    error.code = "GEMINI_CONFIG_MISSING";
+    throw error;
+  }
 }
 
-function isDividerLine(line) {
-  return /^\s*(?:[-_=*]\s*){3,}$/.test(String(line || ""));
+// Keep the original text extraction path, but normalize it into page-first output.
+async function extractTextFromPDF(parser) {
+  const result = await parser.getText();
+
+  return result.pages
+    .map((page) => ({
+      pageNumber: page.num,
+      text: page.text.trim(),
+    }))
+    .sort((left, right) => left.pageNumber - right.pageNumber);
 }
 
-function getHeadingLevel(line) {
-  const text = normalizeInlineSpacing(line);
-  if (!text || text.length > 120) return null;
-  if (/[.!?]$/.test(text) && !/:$/.test(text)) return null;
-
-  const numberedHeadingRegex = /^(\d+(?:\.\d+)*)[.)]?\s+(.+)$/;
-  if (numberedHeadingRegex.test(text)) return 2;
-
-  if (/^(output|example|summary|note|warning)[:]?$/i.test(text)) return 3;
-  if (/^[A-Z][A-Z\s/&()-]{2,}$/.test(text) && /[A-Z]/.test(text)) return 3;
-  if (/^[A-Z][A-Za-z0-9/&(),:'"-]+(?:\s+[A-Z][A-Za-z0-9/&(),:'"-]+){0,7}$/.test(text)) {
-    return 3;
-  }
-
-  return null;
-}
-
-function isCodeLikeLine(line) {
-  const text = String(line || "").trim();
-  if (!text) return false;
-  if (/^\s*(```|~~~)/.test(text)) return true;
-
-  if (/^(db\.[\w$]+|use\s+\w+|show\s+\w+|mongo(?:sh|export|import)\b)/i.test(text)) {
-    return true;
-  }
-
-  if (
-    /\/\/|=>|\bnew Date\(|\$\w+|insertMany\(|insertOne\(|updateOne\(|updateMany\(|deleteOne\(|deleteMany\(|aggregate\(|createIndex\(|find\(|sort\(|limit\(/.test(
-      text
-    )
-  ) {
-    return true;
-  }
-
-  const codeTokenCount = (
-    text.match(/[{}[\]();]|(?:^|\s)(?:\$[A-Za-z_]\w*|_id|createdAt|price|quantity|category|status)(?:\s|:|$)/g) ||
-    []
-  ).length;
-  const wordCount = (text.match(/[A-Za-z]+/g) || []).length;
-
-  if (codeTokenCount >= 3 && wordCount <= 12) return true;
-  if (/^[\]}),]+$/.test(text)) return true;
-
-  return false;
-}
-
-function isCodeContinuationLine(line) {
-  const text = String(line || "").trim();
-  if (!text) return false;
-  if (/^[\]}),]+$/.test(text)) return true;
-  if (/^[{[]/.test(text)) return true;
-  if (/:\s/.test(text) && /[{},[\]]/.test(text)) return true;
-  if (/^(from|localField|foreignField|as|totalSales|totalFruitSales|_id)\s*:/.test(text)) {
-    return true;
-  }
-  return false;
-}
-
-function normalizeParagraphBreaks(lines) {
-  const merged = [];
-  let paragraph = [];
-  let codeLines = [];
-
-  const flushParagraph = () => {
-    if (!paragraph.length) return;
-
-    const text = paragraph
-      .map((line) => normalizeInlineSpacing(line))
-      .filter(Boolean)
-      .join(" ")
-      .replace(/-\s+([a-z])/g, "$1")
-      .replace(/\s+([)}\]])/g, "$1")
-      .replace(/([({\[])\s+/g, "$1");
-
-    if (text) merged.push(text);
-    paragraph = [];
-  };
-
-  const flushCode = () => {
-    if (!codeLines.length) return;
-    merged.push("```javascript");
-    merged.push(...codeLines.map((line) => line.trimEnd()));
-    merged.push("```");
-    codeLines = [];
-  };
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      flushCode();
-      flushParagraph();
-      merged.push("");
-      continue;
-    }
-
-    if (isDividerLine(trimmed)) {
-      flushCode();
-      flushParagraph();
-      continue;
-    }
-
-    if (isCodeLikeLine(trimmed) || (codeLines.length && isCodeContinuationLine(trimmed))) {
-      flushParagraph();
-      codeLines.push(trimmed);
-      continue;
-    }
-
-    if (
-      /^#{1,6}\s+/.test(trimmed) ||
-      /^-\s+/.test(trimmed) ||
-      /^\d+[.)]\s+/.test(trimmed) ||
-      /^\s*(```|~~~)/.test(trimmed)
-    ) {
-      flushCode();
-      flushParagraph();
-      merged.push(trimmed);
-      continue;
-    }
-
-    paragraph.push(trimmed);
-  }
-
-  flushCode();
-  flushParagraph();
-  return merged;
-}
-
-function extractStructuredSections(rawText) {
-  const pageLineRegex =
-    /^\s*(?:[-\u2013\u2014]*\s*)?(?:page\s*)?\d+\s*(?:of|\/)\s*\d+\s*(?:[-\u2013\u2014]*\s*)?$/i;
-
-  const bulletRegex =
-    /^\s*[\u2022\u25CF\u25E6\u25AA\u25AB\u2023\u2219\u25C6\u25C7\u2605\u2606\u25BA\u25B6\u25B8\u25B9\u27A4\u27A2\u27A3\u27A5\u27A6\u27A7\u26AB\u26AA]\s*/;
-
-  const headingRegex = /^\s*(\d+(?:\.\d+)*)[.)]?\s+(.+?)\s*$/;
-  const junkLineRegex = /^\s*\d+\.\s*$/;
-  const footerRegex = /^\s*(confidential|copyright|all rights reserved)\b.*$/i;
-
-  const lines = String(rawText || "")
-    .replace(/\r\n?/g, "\n")
-    .split("\n");
-
-  const cleaned = [];
-  let inCode = false;
-
-  for (let line of lines) {
-    const isFence = /^\s*(```|~~~)/.test(line);
-
-    if (isFence) {
-      inCode = !inCode;
-      cleaned.push(line);
-      continue;
-    }
-
-    if (!inCode) {
-      line = line.replace(/\t/g, " ").replace(/\s+$/g, "");
-
-      if (pageLineRegex.test(line)) continue;
-      if (junkLineRegex.test(line)) continue;
-      if (footerRegex.test(line)) continue;
-
-      if (bulletRegex.test(line)) {
-        line = line.replace(bulletRegex, "- ");
-      } else {
-        line = normalizeInlineSpacing(line);
-      }
-
-      const headingLevel = getHeadingLevel(line);
-      if (headingLevel && !/^#/.test(line.trim())) {
-        const numberedMatch = line.match(headingRegex);
-        if (numberedMatch) {
-          line = `## ${numberedMatch[1]}. ${normalizeInlineSpacing(numberedMatch[2])}`;
-        } else {
-          line = `${"#".repeat(headingLevel)} ${line.trim()}`;
-        }
-      }
-    }
-
-    cleaned.push(line);
-  }
-
-  const normalized = [];
-  let prevBlank = false;
-
-  for (const line of normalizeParagraphBreaks(cleaned)) {
-    const blank = line.trim() === "";
-    if (blank && prevBlank) continue;
-    normalized.push(line);
-    prevBlank = blank;
-  }
-
-  const sections = [];
-  let current = { number: null, title: "General", heading: "## General", contentLines: [] };
-  inCode = false;
-
-  const pushCurrent = () => {
-    const content = current.contentLines.join("\n").trim();
-    if (content.length < 30) return;
-
-    sections.push({
-      number: current.number,
-      title: current.title,
-      heading: current.heading,
-      content,
-      chunks: createAIChunksForSection(current, content),
+async function extractImagesFromPDF(parser) {
+  try {
+    const result = await parser.getImage({
+      imageBuffer: true,
+      imageDataUrl: false,
+      imageThreshold: 24,
     });
-  };
 
-  for (const line of normalized) {
-    const isFence = /^\s*(```|~~~)/.test(line);
-
-    if (isFence) {
-      inCode = !inCode;
-      current.contentLines.push(line);
-      continue;
+    return result.pages
+      .map((page) => ({
+        pageNumber: page.pageNumber,
+        images: page.images.map((image, index) => ({
+          id: `${page.pageNumber}-${index + 1}`,
+          name: image.name || `page-${page.pageNumber}-image-${index + 1}`,
+          width: image.width,
+          height: image.height,
+          kind: image.kind,
+          mimeType: "image/png",
+          buffer: Buffer.from(image.data),
+        })),
+      }))
+      .sort((left, right) => left.pageNumber - right.pageNumber);
+  } catch (error) {
+    if (error?.name !== "DataCloneError") {
+      throw error;
     }
 
-    const sectionHeadingMatch = !inCode ? line.match(/^##\s+(.+?)\s*$/) : null;
-    const match = sectionHeadingMatch ? sectionHeadingMatch[1].match(headingRegex) : null;
+    console.warn(
+      "Embedded image extraction hit a worker cloning issue. Falling back to page screenshots.",
+      error.message
+    );
 
-    if (sectionHeadingMatch) {
-      pushCurrent();
+    const screenshots = await parser.getScreenshot({
+      imageBuffer: true,
+      imageDataUrl: false,
+      desiredWidth: MAX_IMAGE_DIMENSION,
+    });
 
-      const plainHeading = sectionHeadingMatch[1].trim();
-      current = {
-        number: match ? match[1] : null,
-        title: match ? match[2].trim() : plainHeading,
-        heading: `## ${plainHeading}`,
-        contentLines: [],
+    return screenshots.pages
+      .map((page) => ({
+        pageNumber: page.pageNumber,
+        images: page.data?.length
+          ? [
+              {
+                id: `${page.pageNumber}-render-1`,
+                name: `page-${page.pageNumber}-render`,
+                width: page.width,
+                height: page.height,
+                kind: "page-render",
+                mimeType: "image/png",
+                buffer: Buffer.from(page.data),
+              },
+            ]
+          : [],
+      }))
+      .sort((left, right) => left.pageNumber - right.pageNumber);
+  }
+}
+
+async function compressImageForGemini(imageBuffer) {
+  if (imageBuffer.length <= MAX_IMAGE_BYTES) {
+    return {
+      mimeType: "image/png",
+      base64: imageBuffer.toString("base64"),
+    };
+  }
+
+  const sourceImage = await loadImage(imageBuffer);
+  const sourceWidth = sourceImage.width || MAX_IMAGE_DIMENSION;
+  const sourceHeight = sourceImage.height || MAX_IMAGE_DIMENSION;
+  const scale = Math.min(
+    1,
+    MAX_IMAGE_DIMENSION / Math.max(sourceWidth, sourceHeight)
+  );
+  const targetWidth = Math.max(1, Math.round(sourceWidth * scale));
+  const targetHeight = Math.max(1, Math.round(sourceHeight * scale));
+  const canvas = createCanvas(targetWidth, targetHeight);
+  const context = canvas.getContext("2d");
+
+  context.drawImage(sourceImage, 0, 0, targetWidth, targetHeight);
+
+  for (const quality of JPEG_QUALITIES) {
+    const compressedBuffer = canvas.toBuffer("image/jpeg", quality);
+
+    if (compressedBuffer.length <= MAX_IMAGE_BYTES) {
+      return {
+        mimeType: "image/jpeg",
+        base64: compressedBuffer.toString("base64"),
       };
-    } else {
-      current.contentLines.push(line);
     }
   }
 
-  pushCurrent();
-  if (!sections.length) {
-    const fallbackContent = normalized.join("\n").trim();
-    if (fallbackContent) {
-      const fallback = {
-        number: null,
-        title: "General",
-        heading: "## General",
-        content: fallbackContent,
-      };
+  const fallbackBuffer = canvas.toBuffer("image/jpeg", 0.35);
 
-      sections.push({
-        ...fallback,
-        chunks: createAIChunksForSection(fallback, fallbackContent),
+  return {
+    mimeType: "image/jpeg",
+    base64: fallbackBuffer.toString("base64"),
+  };
+}
+
+function extractGeminiText(payload) {
+  const parts =
+    payload?.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text)
+      .filter(Boolean) || [];
+
+  return parts.join("\n").trim();
+}
+
+function normalizeGeminiResponse(rawText) {
+  if (!rawText) {
+    return {
+      description: "No meaningful information could be extracted from this image.",
+      key_points: [],
+    };
+  }
+
+  try {
+    const normalizedJson = rawText
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "");
+    const parsed = JSON.parse(normalizedJson);
+
+    return {
+      description: String(parsed.description || "").trim(),
+      key_points: Array.isArray(parsed.key_points)
+        ? parsed.key_points
+            .map((point) => String(point).trim())
+            .filter(Boolean)
+        : [],
+    };
+  } catch (error) {
+    const lines = rawText
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^[-*\s]+/, "").trim())
+      .filter(Boolean);
+
+    return {
+      description: lines[0] || rawText.trim(),
+      key_points: lines.slice(1),
+    };
+  }
+}
+
+async function analyzeImageWithGemini(image) {
+  validateGeminiConfiguration();
+
+  // Resize and recompress large PDF images before sending them to Gemini.
+  const optimizedImage = await compressImageForGemini(image.buffer);
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: DEFAULT_IMAGE_PROMPT },
+              {
+                inlineData: {
+                  mimeType: optimizedImage.mimeType,
+                  data: optimizedImage.base64,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              description: { type: "STRING" },
+              key_points: {
+                type: "ARRAY",
+                items: { type: "STRING" },
+              },
+            },
+            required: ["description", "key_points"],
+          },
+          temperature: 0.2,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini request failed: ${response.status} ${errorText}`);
+  }
+
+  const payload = await response.json();
+  const rawText = extractGeminiText(payload);
+
+  return normalizeGeminiResponse(rawText);
+}
+
+function buildStructuredOutput(textPages, imagePages) {
+  const pageMap = new Map();
+
+  for (const page of textPages) {
+    pageMap.set(page.pageNumber, {
+      pageNumber: page.pageNumber,
+      text: page.text,
+      images: [],
+    });
+  }
+
+  for (const page of imagePages) {
+    if (!pageMap.has(page.pageNumber)) {
+      pageMap.set(page.pageNumber, {
+        pageNumber: page.pageNumber,
+        text: "",
+        images: [],
       });
     }
-  }
 
-  return sections;
-}
-
-/* ---------------- CHUNKING ---------------- */
-
-function splitIntoSemanticBlocks(text) {
-  const lines = String(text || "").split("\n");
-  const blocks = [];
-  let inCode = false;
-  let codeLines = [];
-  let paragraphLines = [];
-
-  const flushParagraph = () => {
-    const paragraph = paragraphLines.join("\n").trim();
-    if (paragraph) {
-      const type = /^###\s+/.test(paragraph) ? "subheading" : "paragraph";
-      blocks.push({ type, text: paragraph });
-    }
-    paragraphLines = [];
-  };
-
-  const flushCode = () => {
-    const code = codeLines.join("\n").trim();
-    if (code) blocks.push({ type: "code", text: code });
-    codeLines = [];
-  };
-
-  for (const line of lines) {
-    const isFence = /^\s*(```|~~~)/.test(line);
-
-    if (isFence) {
-      if (!inCode) {
-        flushParagraph();
-        inCode = true;
-        codeLines.push(line);
-      } else {
-        codeLines.push(line);
-        flushCode();
-        inCode = false;
-      }
-      continue;
-    }
-
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (line.trim() === "") {
-      flushParagraph();
-    } else {
-      paragraphLines.push(line);
-    }
-  }
-
-  flushParagraph();
-  if (codeLines.length) flushCode();
-
-  return blocks;
-}
-
-function splitLongText(text, maxChars = 900) {
-  const parts = [];
-  let remaining = String(text || "").trim();
-
-  while (remaining.length > maxChars) {
-    const slice = remaining.slice(0, maxChars + 1);
-    let cut = slice.lastIndexOf("\n");
-    if (cut < 0) cut = slice.lastIndexOf("\n### ");
-    if (cut < 0) cut = slice.lastIndexOf(". ");
-    if (cut < 0) cut = slice.lastIndexOf(": ");
-    if (cut < 0) cut = slice.lastIndexOf(" ");
-    if (cut < 0 || cut < Math.floor(maxChars * 0.6)) cut = maxChars;
-
-    parts.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
-  }
-
-  if (remaining) parts.push(remaining);
-  return parts;
-}
-
-function chunkWithOverlap(blocks, maxChars = 900, overlapChars = 120) {
-  const chunkTexts = [];
-  let current = "";
-
-  const buildOverlap = (text) => {
-    const source = String(text || "").trim();
-    if (!source) return "";
-
-    const tail = source.slice(Math.max(0, source.length - overlapChars)).trim();
-    const sentenceCut = Math.max(tail.lastIndexOf("\n"), tail.lastIndexOf(". "));
-    const overlap = sentenceCut >= 0 ? tail.slice(sentenceCut + 1).trim() : tail;
-    return overlap.replace(/^[^\w#`({\[]+/, "").trim();
-  };
-
-  const pushChunk = () => {
-    const text = current.trim();
-    if (text) chunkTexts.push(text);
-    current = "";
-  };
-
-  for (const block of blocks) {
-    const blockText = block.text.trim();
-    if (!blockText) continue;
-
-    const parts =
-      blockText.length > maxChars ? splitLongText(blockText, maxChars) : [blockText];
-
-    for (const part of parts) {
-      const separator = current ? "\n\n" : "";
-      const candidate = `${current}${separator}${part}`;
-
-      if (candidate.length <= maxChars) {
-        current = candidate;
-      } else {
-        const prev = current.trim();
-        pushChunk();
-
-        const overlap = prev ? buildOverlap(prev) : "";
-
-        current = overlap ? `${overlap}\n\n${part}` : part;
-      }
-    }
-  }
-
-  pushChunk();
-  return chunkTexts;
-}
-
-function createAIChunksForSection(section, content) {
-  const blocks = splitIntoSemanticBlocks(content);
-  const chunkTexts = chunkWithOverlap(blocks, 900, 120);
-
-  return chunkTexts.map((text, index) => ({
-    id: `${section.number || "0"}-${index}`,
-    index,
-    sectionNumber: section.number,
-    sectionTitle: section.title,
-    heading: section.heading,
-    type: /```|~~~/.test(text) ? "mixed" : "text",
-    charCount: text.length,
-    text: `${section.heading || "## General"}\n\n${text}`,
-  }));
-}
-
-function buildAIDocumentText(sections) {
-  return sections
-    .map((section) => {
-      const heading = section.heading || "## General";
-      const body = String(section.content || "").trim();
-      return body ? `${heading}\n\n${body}` : heading;
-    })
-    .join("\n\n");
-}
-
-function buildAIPayload(sections) {
-  const allChunks = [];
-
-  for (const section of sections) {
-    for (const chunk of section.chunks) {
-      allChunks.push(chunk);
-    }
+    pageMap.get(page.pageNumber).images = page.images;
   }
 
   return {
-    totalSections: sections.length,
-    totalChunks: allChunks.length,
-    documentText: buildAIDocumentText(sections),
-    sectionTitles: sections.map((section) => section.heading),
-    chunks: allChunks,
+    pages: Array.from(pageMap.values()).sort(
+      (left, right) => left.pageNumber - right.pageNumber
+    ),
   };
 }
 
-/* ---------------- ROUTE ---------------- */
+app.post(
+  "/upload",
+  upload.fields([
+    { name: "pdf", maxCount: 1 },
+    { name: "file", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    let filePath;
+    let textParser;
+    let imageParser;
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  let filePath;
+    try {
+      const file = req.files?.pdf?.[0] || req.files?.file?.[0];
 
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
+      if (!file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
 
-    filePath = req.file.path;
-    const fileType = req.file.mimetype;
+      if (file.mimetype !== "application/pdf") {
+        return res.status(400).json({ error: "Only PDF allowed" });
+      }
 
-    let text = "";
+      validateGeminiConfiguration();
 
-    // PDF
-    if (fileType === "application/pdf") {
-      const buffer = fs.readFileSync(filePath);
-      const parser = new PDFParse({ data: buffer });
-      const data = await parser.getText();
-      text = data.text;
-      await parser.destroy();
-    }
+      filePath = file.path;
+      const dataBuffer = await fs.promises.readFile(filePath);
+      textParser = new PDFParse({ data: dataBuffer });
+      imageParser = new PDFParse({ data: dataBuffer });
 
-    // DOCX
-    else if (
-      fileType ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ) {
-      const result = await mammoth.extractRawText({ path: filePath });
-      text = result.value;
-    }
+      const textPages = await extractTextFromPDF(textParser);
+      const imagePages = await extractImagesFromPDF(imageParser);
 
-    else {
-      return res.status(400).json({ error: "Unsupported file type" });
-    }
+      const analyzedImagePages = await Promise.all(
+        imagePages.map(async (page) => ({
+          pageNumber: page.pageNumber,
+          images: await Promise.all(
+            page.images.map(async (image) => {
+              try {
+                return await analyzeImageWithGemini(image);
+              } catch (error) {
+                console.error(
+                  `Image analysis failed on page ${page.pageNumber} (${image.name}):`,
+                  error.message
+                );
 
-    const sections = extractStructuredSections(text);
-    const aiInput = buildAIPayload(sections);
+                return {
+                  description: "Image analysis failed and was skipped.",
+                  key_points: [],
+                };
+              }
+            })
+          ),
+        }))
+      );
 
-    res.json({
-      totalSections: sections.length,
-      sections,
-      aiInput,
-    });
+      const structuredOutput = buildStructuredOutput(textPages, analyzedImagePages);
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to process file" });
+      return res.json(structuredOutput);
+    } catch (error) {
+      console.error("FULL ERROR:", error);
 
-  } finally {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+      if (error?.code === "GEMINI_CONFIG_MISSING") {
+        return res.status(500).json({
+          error: "Image analysis is unavailable because GEMINI_API_KEY is not configured.",
+        });
+      }
+
+      return res
+        .status(500)
+        .json({ error: error.message || "Failed to process PDF" });
+    } finally {
+      if (textParser) {
+        await textParser.destroy().catch(() => {});
+      }
+
+      if (imageParser) {
+        await imageParser.destroy().catch(() => {});
+      }
+
+      if (filePath) {
+        await fs.promises.unlink(filePath).catch(() => {});
+      }
     }
   }
-});
-
-/* ---------------- SERVER ---------------- */
+);
 
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
