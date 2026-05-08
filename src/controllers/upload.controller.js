@@ -12,6 +12,7 @@ const {
 } = require("../services/gemini.service");
 const { buildStructuredOutput } = require("../utils/structured-output");
 const { chunkStructuredPDF } = require("../utils/chunk-structured-pdf");
+const { embedChunks } = require("../utils/embed-chunks");
 
 async function uploadPdf(req, res) {
   let filePath;
@@ -67,9 +68,11 @@ async function uploadPdf(req, res) {
 
     const documentId = req.body.documentId || file.filename;
     const chunkStructured = chunkStructuredPDF(structuredOutput.pages, documentId);
+    const chunks = await embedChunks(chunkStructured);
 
-    // return res.json(structuredOutput);
-    return res.json(chunkStructured);
+    return res.json({
+      chunks,
+    });
     
   } catch (error) {
     console.error("FULL ERROR:", error);
