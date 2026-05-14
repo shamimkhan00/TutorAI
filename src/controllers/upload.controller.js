@@ -1,3 +1,4 @@
+// controllers/upload.controller.js
 const fs = require("fs");
 
 const {
@@ -13,6 +14,7 @@ const {
 const { buildStructuredOutput } = require("../utils/structured-output");
 const { chunkStructuredPDF } = require("../utils/chunk-structured-pdf");
 const { embedChunks } = require("../utils/embed-chunks");
+const { saveProcessedDocument } = require("../services/document-storage.service");
 
 async function uploadPdf(req, res) {
   let filePath;
@@ -22,13 +24,9 @@ async function uploadPdf(req, res) {
   try {
     const file = req.files?.pdf?.[0] || req.files?.file?.[0];
 
-    if (!file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    if (file.mimetype !== "application/pdf") {
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    if (file.mimetype !== "application/pdf")
       return res.status(400).json({ error: "Only PDF allowed" });
-    }
 
     validateGeminiConfiguration();
 
@@ -49,15 +47,7 @@ async function uploadPdf(req, res) {
             try {
               return await analyzeImageWithGemini(image);
             } catch (error) {
-              console.error(
-                `Image analysis failed on page ${page.pageNumber} (${image.name}):`,
-                error.message
-              );
-
-              return {
-                description: "Image analysis failed and was skipped.",
-                key_points: [],
-              };
+              return { description: "Image analysis failed.", key_points: [] };
             }
           })
         ),
@@ -65,38 +55,40 @@ async function uploadPdf(req, res) {
     );
 
     const structuredOutput = buildStructuredOutput(textPages, analyzedImagePages);
-
     const documentId = req.body.documentId || file.filename;
     const chunkStructured = chunkStructuredPDF(structuredOutput.pages, documentId);
     const chunks = await embedChunks(chunkStructured);
 
-    return res.json({
+    const userId = req.user?.uid || req.userId;
+    const savedDocument = await saveProcessedDocument({
+      userId,
+      fileName: file.originalname,
+      fileType: file.mimetype,
+      structuredOutput,
       chunks,
     });
-    
+
+    return res.json({
+      success: true,
+      documentId: savedDocument.document._id,
+      filename: file.originalname,
+      pageCount: structuredOutput.pages.length,
+      chunkCount: savedDocument.document.chunkCount,
+      structuredOutput,
+      chunks,
+    });
+
   } catch (error) {
     console.error("FULL ERROR:", error);
-
     if (error?.code === "GEMINI_CONFIG_MISSING") {
-      return res.status(500).json({
-        error:
-          "Image analysis is unavailable because GEMINI_API_KEY is not configured.",
-      });
+      return res.status(500).json({ error: "GEMINI_API_KEY not configured." });
     }
-
-    return res
-      .status(500)
-      .json({ error: error.message || "Failed to process PDF" });
+    return res.status(500).json({ error: error.message || "Failed to process PDF" });
   } finally {
     await destroyParser(textParser);
     await destroyParser(imageParser);
-
-    if (filePath) {
-      await fs.promises.unlink(filePath).catch(() => {});
-    }
+    if (filePath) await fs.promises.unlink(filePath).catch(() => {});
   }
 }
 
-module.exports = {
-  uploadPdf,
-};
+module.exports = { uploadPdf };

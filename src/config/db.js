@@ -1,7 +1,7 @@
 const dns = require("dns");
 const { MongoClient } = require("mongodb");
 
-const { MONGO_URI, MONGO_DNS_SERVERS } = require("./env");
+const { MONGO_URI, MONGO_DB_NAME, MONGO_DNS_SERVERS } = require("./env");
 
 let client;
 let database;
@@ -12,7 +12,7 @@ async function connectDB() {
   }
 
   if (!MONGO_URI) {
-    throw new Error("MONGO_URI is not configured");
+    throw new Error("MONGODB_URI or MONGO_URI is not configured");
   }
 
   if (MONGO_URI.startsWith("mongodb+srv://") && MONGO_DNS_SERVERS.length > 0) {
@@ -21,9 +21,9 @@ async function connectDB() {
 
   client = new MongoClient(MONGO_URI);
   await client.connect();
-  database = client.db();
+  database = client.db(MONGO_DB_NAME);
 
-  console.log("MongoDB connected");
+  console.log(`MongoDB connected to ${MONGO_DB_NAME}`);
 
   return database;
 }

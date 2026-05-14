@@ -151,7 +151,7 @@ function appendTextUnit(units, unit, minCharacters) {
   });
 }
 
-function createChunk(documentId, page, type, index, content) {
+function createChunk(documentId, page, type, index, content, metadata = {}) {
   const cleanedContent = cleanText(content);
 
   if (!cleanedContent) {
@@ -166,6 +166,7 @@ function createChunk(documentId, page, type, index, content) {
     content: cleanedContent,
     metadata: {
       source: "pdf",
+      ...metadata,
     },
   };
 }
@@ -204,9 +205,12 @@ function chunkPageText(page, documentId) {
     const chunk = createChunk(
       documentId,
       page.pageNumber,
-      unit.type,
+      "text",
       index,
-      unit.content
+      unit.content,
+      {
+        semanticType: unit.type,
+      }
     );
 
     if (chunk) {
@@ -223,37 +227,35 @@ function chunkPageImages(page, documentId) {
   let index = 0;
 
   for (const image of images) {
-    const descriptionChunk = createChunk(
-      documentId,
-      page.pageNumber,
-      "image_description",
-      index,
-      image && image.description
-    );
-
-    if (descriptionChunk) {
-      chunks.push(descriptionChunk);
-      index += 1;
-    }
-
+    const description = cleanText(image && image.description);
     const keyPoints = Array.isArray(image && image.key_points)
-      ? image.key_points
+      ? image.key_points.map(cleanText).filter(Boolean)
       : [];
 
-    for (const keyPoint of keyPoints) {
-      const conceptChunk = createChunk(
-        documentId,
-        page.pageNumber,
-        "concept",
-        index,
-        keyPoint
-      );
-
-      if (conceptChunk) {
-        chunks.push(conceptChunk);
-        index += 1;
-      }
+    if (!description && keyPoints.length === 0) {
+      continue;
     }
+
+    const keyPointsContent =
+      keyPoints.length > 0 ? `\n\nKey Points:\n- ${keyPoints.join("\n- ")}` : "";
+
+    const imageChunk = {
+      documentId,
+      page: page.pageNumber,
+      chunkId: `${page.pageNumber}-image-${index}`,
+      type: "image",
+      content: `${description}${keyPointsContent}`.trim(),
+      imageDescription: description,
+      keyPoints,
+      metadata: {
+        source: "pdf",
+        semanticType: "image",
+        imageIndex: index,
+      },
+    };
+
+    chunks.push(imageChunk);
+    index += 1;
   }
 
   return chunks;
