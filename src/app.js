@@ -1,9 +1,9 @@
 require("dotenv").config();
 
 const express = require("express");
-
 const { CORS_ORIGINS } = require("./config/env");
 const uploadRoutes = require("./routes/upload.routes");
+const topicRoutes = require("./routes/topic.routes");
 
 const app = express();
 
@@ -32,5 +32,6 @@ app.get("/", (req, res) => {
 });
 
 app.use(uploadRoutes);
+app.use(topicRoutes);
 
 module.exports = app;

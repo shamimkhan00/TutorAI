@@ -1,4 +1,4 @@
-const { createEmbedding } = require("../../services/embedding.service");
+const { createEmbedding } = require("../services/embedding.service");
 
 const EMBEDDING_DELAY_MS = 200;
 function delay(ms) {
