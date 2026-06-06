@@ -183,7 +183,7 @@ async function generateTopicsForDocument(documentId, userId) {
   const chunks = await db
     .collection(CHUNKS_COLLECTION)
     .find(
-      { documentId: docObjectId, userId, type: "text" },
+      { documentId: docObjectId, userId},
       { projection: { content: 1, page: 1, chunkId: 1, _id: 0 } }
     )
     .sort({ page: 1, chunkId: 1 })
