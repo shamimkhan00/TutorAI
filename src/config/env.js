@@ -1,5 +1,14 @@
 require("dotenv").config();
 
+function normalizeOrigin(value) {
+  if (!value) return null;
+  try {
+    return new URL(value.trim()).origin;
+  } catch {
+    return value.trim().replace(/\/+$/, "");
+  }
+}
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const MONGO_URI = process.env.MONGODB_URI || process.env.MONGO_URI;
@@ -9,10 +18,19 @@ const MONGO_DNS_SERVERS = (process.env.MONGO_DNS_SERVERS || "8.8.8.8,1.1.1.1")
   .map((value) => value.trim())
   .filter(Boolean);
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "http://localhost:3000")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
+const CORS_ORIGINS = Array.from(
+  new Set(
+    [
+      ...(process.env.CORS_ORIGINS || "http://localhost:3000").split(","),
+      process.env.FRONTEND_URL,
+      process.env.BACKEND_URL,
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+    ]
+      .map(normalizeOrigin)
+      .filter(Boolean)
+  )
+);
 const MAX_IMAGE_DIMENSION = Number.parseInt(
   process.env.MAX_IMAGE_DIMENSION || "1600",
   10
